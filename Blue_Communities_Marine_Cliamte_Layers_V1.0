@@ -1,0 +1,1666 @@
+# ============================================================
+# Sabah Marine Vision - Blue Communities marine climate layers
+# ============================================================
+#
+# Purpose
+#   1. Read annual Blue Communities NetCDF files (12 monthly layers per year).
+#   2. Extract a Sabah marine study area.
+#   3. Build multi-year monthly climatologies and annual summaries.
+#   4. Fill ONLY small coastal no-data slivers, without filling across land.
+#   5. Create change-from-historical layers and QA masks/logs.
+#   Coastal filling is controlled by mapped WATER FRACTION within each model
+#   cell. Genuine bays, inlets, estuaries and passages between islands remain
+#   open. Low-water-fraction shoreline/riverbank cells may receive a value but
+#   cannot propagate it inland. Existing NetCDF values are never removed.
+#
+# IMPORTANT
+#   - For final SMV outputs, set marine_aoi_path to the agreed Sabah Marine
+#     Vision marine planning / waters boundary.
+#   - If marine_aoi_path is blank, the script uses a broad PROVISIONAL
+#     Sabah processing window for QA only. That is NOT a legal/state-waters
+#     boundary and should not be used as the final SMV mask.
+#   - The original model data are never overwritten.
+#
+# The uploaded example file has 12 monthly time steps per annual NetCDF
+# on a 0.1 degree grid. This script therefore treats each layer as one
+# monthly mean (Jan-Dec).
+# ============================================================
+
+
+# -----------------------------
+# 0. Packages
+# -----------------------------
+
+required_packages <- c("terra", "sf")
+
+to_install <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(to_install) > 0) {
+  install.packages(to_install)
+}
+
+library(terra)
+library(sf)
+
+
+# -----------------------------
+# 1. User settings
+# -----------------------------
+
+# Input folders
+historic_dir <- "F:/3_Blue/GIS/historic"
+rcp45_dir    <- "F:/3_Blue/GIS/RCP45"
+rcp85_dir    <- "F:/3_Blue/GIS/RCP85"
+
+# Land / coastline layer supplied by the user
+borneo_path  <- "E:/GIS_layers/Borneoshape/Borneo_clipping.shp"
+
+# FINAL SMV MARINE AOI:
+# Put the path to the agreed Sabah marine boundary here when available.
+# Example:
+# marine_aoi_path <- "E:/GIS_layers/SMV/Sabah_Marine_AOI.gpkg"
+marine_aoi_path <- ""
+
+# Broad QA-only fallback window used if marine_aoi_path is blank.
+# This deliberately extends beyond Sabah so that no Sabah coast is clipped.
+# It is a processing window, NOT a jurisdictional boundary.
+provisional_bbox <- c(
+  xmin = 114.5,
+  xmax = 120.5,
+  ymin = 3.5,
+  ymax = 8.0
+)
+
+# Coastal filling controls.
+# The source model grid is ~0.1 degree (~11 km).
+max_fill_km <- 50
+
+# IMPORTANT: do NOT alter the coastline geometry to remove rivers.
+# Instead, classify each coarse model cell by how much genuine mapped water
+# it contains. This retains bays, inlets and passages between islands.
+#
+# fine_factor = 20 means each 0.1-degree model cell is assessed using a
+# 20 x 20 subgrid (~0.005 degree, roughly 0.5 km in Sabah).
+fine_factor <- 20
+
+# Cells with at least this fraction of mapped water are allowed to act as
+# "marine bridge" cells and propagate the model field toward the shoreline.
+# At 15%, an 11 km model cell needs roughly 18 km2 of mapped water.
+# Narrow river channels normally fall below this, whereas major bays,
+# estuaries, straits and island-mainland passages remain connected.
+min_bridge_water_fraction <- 0.15
+
+# Time periods.
+# Recommended SMV baseline = full historical run.
+baseline_period <- c(1980, 2005)
+
+# 20-year future climatologies. The mid- and late-century periods match
+# those used in Kay et al. (2023); a near-term period is added for SMV.
+future_periods <- list(
+  near_2020_2039 = c(2020, 2039),
+  mid_2040_2059  = c(2040, 2059),
+  late_2079_2098 = c(2079, 2098)
+)
+
+# Core variables: deliberately short list of management-relevant indicators.
+core_variables <- data.frame(
+  var = c(
+    "T_surface",
+    "T_bottom",
+    "S_surface",
+    "O2_bottom",
+    "pH_surface",
+    "pH_bottom",
+    "satarag_surface",
+    "netPP_total"
+  ),
+  label = c(
+    "Sea surface temperature",
+    "Bottom temperature",
+    "Surface salinity",
+    "Bottom dissolved oxygen",
+    "Surface pH",
+    "Bottom pH",
+    "Surface aragonite saturation state",
+    "Column-total net primary production"
+  ),
+  seasonal_summary = c(
+    "max",   # warmest climatological month
+    "max",
+    "mean",
+    "min",   # lowest climatological month
+    "min",
+    "min",
+    "min",
+    "mean"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Optional second-tier variables. These are NOT processed unless
+# include_optional is set to TRUE.
+optional_variables <- data.frame(
+  var = c(
+    "O2_surface",
+    "satarag_bottom",
+    "chl_surface",
+    "Pc_total",
+    "Zc_total"
+  ),
+  label = c(
+    "Surface dissolved oxygen",
+    "Bottom aragonite saturation state",
+    "Surface chlorophyll-a",
+    "Column-total phytoplankton biomass",
+    "Column-total zooplankton biomass"
+  ),
+  seasonal_summary = c("min", "min", "mean", "mean", "mean"),
+  stringsAsFactors = FALSE
+)
+
+include_optional <- FALSE
+
+variables <- if (include_optional) {
+  rbind(core_variables, optional_variables)
+} else {
+  core_variables
+}
+
+# Variables for which a percentage change layer is useful.
+# Other variables are reported as absolute change in their native units.
+percent_change_variables <- c("netPP_total", "chl_surface", "Pc_total", "Zc_total")
+
+
+# -----------------------------
+# 2. Output folder on C: drive
+# -----------------------------
+
+user_profile <- Sys.getenv("USERPROFILE")
+
+if (!nzchar(user_profile)) {
+  stop("USERPROFILE is not available. Set output_root manually to a folder under C:/Users/<name>/Documents.")
+}
+
+documents_dir <- file.path(user_profile, "Documents")
+output_root <- file.path(documents_dir, "Sabah_Marine_Vision_Climate")
+
+dir.create(output_root, recursive = TRUE, showWarnings = FALSE)
+
+# Warn if Documents is not on C:, because the user asked for C:.
+documents_norm <- normalizePath(documents_dir, winslash = "/", mustWork = FALSE)
+if (!grepl("^[Cc]:/", documents_norm)) {
+  warning(
+    "Your Windows Documents folder does not appear to be on C:. ",
+    "If required, set output_root manually to C:/Users/<name>/Documents/Sabah_Marine_Vision_Climate"
+  )
+}
+
+dirs <- c(
+  "climatologies",
+  "change_from_baseline",
+  "qa",
+  "metadata",
+  "temp"
+)
+
+for (d in dirs) {
+  dir.create(file.path(output_root, d), recursive = TRUE, showWarnings = FALSE)
+}
+
+terraOptions(
+  tempdir = file.path(output_root, "temp"),
+  progress = 1
+)
+
+write.csv(
+  variables,
+  file.path(output_root, "metadata", "variables_processed.csv"),
+  row.names = FALSE
+)
+
+
+# -----------------------------
+# 3. Helper functions
+# -----------------------------
+
+extract_year <- function(x) {
+  b <- basename(x)
+  y <- sub("^.*\\.([12][0-9]{3})\\.nc$", "\\1", b, ignore.case = TRUE)
+  y <- suppressWarnings(as.integer(y))
+  y
+}
+
+inventory_nc <- function(folder, scenario) {
+  if (!dir.exists(folder)) {
+    stop("Input folder does not exist: ", folder)
+  }
+  
+  files <- list.files(
+    folder,
+    pattern = "\\.nc$",
+    full.names = TRUE,
+    ignore.case = TRUE
+  )
+  
+  if (length(files) == 0) {
+    stop("No .nc files found in: ", folder)
+  }
+  
+  years <- extract_year(files)
+  
+  if (any(is.na(years))) {
+    bad <- files[is.na(years)]
+    stop(
+      "Could not extract a 4-digit year from these NetCDF filenames:\n",
+      paste(bad, collapse = "\n")
+    )
+  }
+  
+  out <- data.frame(
+    scenario = scenario,
+    year = years,
+    file = files,
+    stringsAsFactors = FALSE
+  )
+  
+  out <- out[order(out$year), ]
+  
+  if (anyDuplicated(out$year)) {
+    dup <- unique(out$year[duplicated(out$year)])
+    stop(
+      "More than one NetCDF file found for year(s) ",
+      paste(dup, collapse = ", "),
+      " in ",
+      folder
+    )
+  }
+  
+  out
+}
+
+select_period <- function(inventory, start_year, end_year) {
+  x <- inventory[
+    inventory$year >= start_year &
+      inventory$year <= end_year,
+  ]
+  
+  expected <- seq(start_year, end_year)
+  missing_years <- setdiff(expected, x$year)
+  
+  if (length(missing_years) > 0) {
+    warning(
+      inventory$scenario[1],
+      ": missing years in ",
+      start_year, "-", end_year, ": ",
+      paste(missing_years, collapse = ", ")
+    )
+  }
+  
+  if (nrow(x) == 0) {
+    stop(
+      "No files available for ",
+      inventory$scenario[1],
+      " in ",
+      start_year, "-", end_year
+    )
+  }
+  
+  x
+}
+
+days_in_month_base <- function(year, month) {
+  start <- as.Date(sprintf("%04d-%02d-01", year, month))
+  
+  if (month == 12) {
+    next_start <- as.Date(sprintf("%04d-01-01", year + 1))
+  } else {
+    next_start <- as.Date(sprintf("%04d-%02d-01", year, month + 1))
+  }
+  
+  as.integer(next_start - start)
+}
+
+period_month_weights <- function(years) {
+  vapply(
+    1:12,
+    function(m) {
+      mean(vapply(years, days_in_month_base, integer(1), month = m))
+    },
+    numeric(1)
+  )
+}
+
+safe_name <- function(x) {
+  gsub("[^A-Za-z0-9_-]+", "_", x)
+}
+
+write_raster <- function(x, filename) {
+  dir.create(dirname(filename), recursive = TRUE, showWarnings = FALSE)
+  writeRaster(
+    x,
+    filename,
+    overwrite = TRUE
+  )
+  invisible(filename)
+}
+
+
+# -----------------------------
+# 4. Read input inventories
+# -----------------------------
+
+historic_inventory <- inventory_nc(historic_dir, "historical")
+rcp45_inventory    <- inventory_nc(rcp45_dir, "rcp45")
+rcp85_inventory    <- inventory_nc(rcp85_dir, "rcp85")
+
+all_inventory <- rbind(
+  historic_inventory,
+  rcp45_inventory,
+  rcp85_inventory
+)
+
+write.csv(
+  all_inventory,
+  file.path(output_root, "metadata", "netcdf_inventory.csv"),
+  row.names = FALSE
+)
+
+
+# -----------------------------
+# 5. Prepare Sabah AOI and land mask
+# -----------------------------
+
+if (!file.exists(borneo_path)) {
+  stop("Borneo shapefile not found: ", borneo_path)
+}
+
+borneo_sf <- st_read(borneo_path, quiet = TRUE)
+
+if (is.na(st_crs(borneo_sf))) {
+  stop(
+    "The Borneo shapefile has no CRS. Assign its correct CRS first; ",
+    "do not assume EPSG:4326 without checking."
+  )
+}
+
+borneo_sf <- st_make_valid(borneo_sf)
+borneo_sf <- st_transform(borneo_sf, 4326)
+
+# Try to identify a feature called Sabah in the supplied layer.
+# This is used ONLY to improve the provisional processing extent.
+# It is not used to manufacture a marine jurisdiction boundary.
+attrs <- st_drop_geometry(borneo_sf)
+
+if (ncol(attrs) > 0) {
+  row_text <- apply(
+    attrs,
+    1,
+    function(z) paste(as.character(z), collapse = " | ")
+  )
+  sabah_hit <- grepl("\\bSabah\\b", row_text, ignore.case = TRUE)
+} else {
+  sabah_hit <- rep(FALSE, nrow(borneo_sf))
+}
+
+if (any(sabah_hit)) {
+  sabah_land_sf <- st_union(borneo_sf[sabah_hit, ])
+  
+  b <- st_bbox(sabah_land_sf)
+  
+  # Expand the land bounding box for a broad coastal QA window.
+  provisional_bbox <- c(
+    xmin = unname(b["xmin"]) - 0.7,
+    xmax = unname(b["xmax"]) + 0.7,
+    ymin = unname(b["ymin"]) - 0.7,
+    ymax = unname(b["ymax"]) + 0.7
+  )
+  
+  message("A Sabah feature was found in the Borneo layer; using it to define the provisional processing window.")
+} else {
+  message(
+    "No attribute value 'Sabah' was found in the Borneo layer; ",
+    "using the fixed provisional Sabah processing window."
+  )
+}
+
+if (nzchar(marine_aoi_path)) {
+  
+  if (!file.exists(marine_aoi_path)) {
+    stop("marine_aoi_path was set but the file does not exist: ", marine_aoi_path)
+  }
+  
+  marine_sf <- st_read(marine_aoi_path, quiet = TRUE)
+  
+  if (is.na(st_crs(marine_sf))) {
+    stop("The marine AOI has no CRS: ", marine_aoi_path)
+  }
+  
+  marine_sf <- st_make_valid(marine_sf)
+  marine_sf <- st_transform(marine_sf, 4326)
+  marine_sf <- st_union(marine_sf)
+  
+  aoi_status <- "FINAL_SMv_MARINE_AOI"
+  
+} else {
+  
+  # Use [[ ]] so each coordinate is an unnamed numeric scalar.
+  # Using [ ] retains the original coordinate name and can create names
+  # such as xmin.xmin, which causes sf::st_bbox() to fail.
+  bbox_vals <- c(
+    xmin = as.numeric(provisional_bbox[["xmin"]]),
+    ymin = as.numeric(provisional_bbox[["ymin"]]),
+    xmax = as.numeric(provisional_bbox[["xmax"]]),
+    ymax = as.numeric(provisional_bbox[["ymax"]])
+  )
+  
+  if (anyNA(bbox_vals) || !all(is.finite(bbox_vals))) {
+    stop(
+      "Invalid provisional bounding box: ",
+      paste(names(bbox_vals), bbox_vals, sep = "=", collapse = ", ")
+    )
+  }
+  
+  marine_sf <- st_as_sfc(
+    st_bbox(
+      bbox_vals,
+      crs = st_crs(4326)
+    )
+  )
+  
+  aoi_status <- "PROVISIONAL_QA_WINDOW_NOT_A_MARINE_BOUNDARY"
+  
+  warning(
+    "No final marine AOI has been supplied. Outputs will use a broad Sabah QA window. ",
+    "Replace marine_aoi_path before producing final SMV layers."
+  )
+}
+
+writeLines(
+  c(
+    paste("AOI status:", aoi_status),
+    paste("marine_aoi_path:", ifelse(nzchar(marine_aoi_path), marine_aoi_path, "<not supplied>")),
+    paste("max_fill_km:", max_fill_km),
+    paste("fine_factor:", fine_factor),
+    paste("min_bridge_water_fraction:", min_bridge_water_fraction),
+    paste("created:", Sys.time())
+  ),
+  file.path(output_root, "metadata", "processing_settings.txt")
+)
+
+# Use one known variable from the first historical file as the raster template.
+sample_file <- historic_inventory$file[1]
+
+template <- rast(
+  sample_file,
+  subds = "T_surface",
+  lyrs = 1,
+  drivers = "NETCDF"
+)
+
+if (is.na(crs(template)) || crs(template) == "") {
+  crs(template) <- "EPSG:4326"
+}
+
+# Crop to the analysis AOI extent.
+marine_v <- vect(marine_sf)
+template <- crop(template, ext(marine_v), snap = "out")
+
+# Make template values simple / in-memory.
+template[] <- 1
+
+borneo_v <- vect(borneo_sf)
+
+# AOI mask.
+# touches=TRUE is appropriate here because we want to retain any model cell
+# that intersects the analysis area.
+aoi_mask <- rasterize(
+  marine_v,
+  template,
+  field = 1,
+  touches = TRUE
+)
+
+# ------------------------------------------------------------
+# Build marine eligibility from WATER FRACTION, not coastline buffering
+# ------------------------------------------------------------
+#
+# Earlier versions attempted to "clean" the coastline by buffering land.
+# That was the wrong approach for Sabah because it can close genuine bays,
+# inlets, narrow straits and water between islands.
+#
+# This version leaves the Borneo geometry completely unchanged.
+#
+# For every coarse (~11 km) model cell we calculate the fraction of the cell
+# that is mapped water using a much finer subgrid. The result is then used
+# in two different ways:
+#
+#   MARINE BRIDGE CELL
+#     enough mapped water to represent a genuine marine/estuarine waterbody;
+#     these cells may propagate a fill value farther toward the coast.
+#
+#   TERMINAL COASTAL CELL
+#     a cell touched by the raw Borneo land boundary (or containing a small
+#     mapped-water fraction) but not marine enough to act as a bridge;
+#     it may RECEIVE a value, but it may NOT propagate that value farther.
+#
+# This is what prevents the fill from walking up river systems while still
+# retaining major bays, inlets and passages between islands.
+
+# Work only with land near the raster analysis extent.
+marine_bbox_sf <- st_as_sfc(
+  st_bbox(
+    c(
+      xmin = xmin(template) - 0.5,
+      ymin = ymin(template) - 0.5,
+      xmax = xmax(template) + 0.5,
+      ymax = ymax(template) + 0.5
+    ),
+    crs = st_crs(4326)
+  )
+)
+
+borneo_local_sf <- suppressWarnings(
+  st_crop(
+    borneo_sf,
+    st_bbox(marine_bbox_sf)
+  )
+)
+
+if (nrow(borneo_local_sf) == 0) {
+  stop("No Borneo land geometry overlaps the marine processing area.")
+}
+
+borneo_local_sf <- st_make_valid(borneo_local_sf)
+borneo_local_v <- vect(borneo_local_sf)
+
+# ------------------------------------------------------------
+# Fine subgrid aligned exactly to the model grid
+# ------------------------------------------------------------
+
+fine_template <- rast(
+  ext(template),
+  nrows = nrow(template) * fine_factor,
+  ncols = ncol(template) * fine_factor,
+  crs = crs(template)
+)
+
+# 1 = land at the fine-cell centre; 0 = mapped water.
+# Using fine subcells instead of the coarse model-cell centre allows narrow
+# coastal water, bays and island channels to be represented quantitatively.
+fine_land <- rasterize(
+  borneo_local_v,
+  fine_template,
+  field = 1,
+  background = 0,
+  touches = FALSE
+)
+
+fine_water <- 1 - fine_land
+names(fine_water) <- "fine_water"
+
+# Fraction of each original model cell that is mapped water.
+water_fraction <- aggregate(
+  fine_water,
+  fact = fine_factor,
+  fun = "mean",
+  na.rm = TRUE
+)
+
+# The fine grid was constructed from exactly the same extent and an integer
+# multiple of rows/columns, so the aggregate should match the model geometry.
+if (!compareGeom(
+  water_fraction,
+  template,
+  stopOnError = FALSE,
+  crs = TRUE,
+  ext = TRUE,
+  rowcol = TRUE,
+  res = TRUE
+)) {
+  stop(
+    "Water-fraction grid does not align with the NetCDF model grid. ",
+    "Check fine_factor and template geometry."
+  )
+}
+
+water_fraction <- mask(
+  water_fraction,
+  aoi_mask
+)
+
+names(water_fraction) <- "mapped_water_fraction"
+
+# ------------------------------------------------------------
+# Marine bridge cells
+# ------------------------------------------------------------
+#
+# These are the cells allowed to propagate values through open marine water,
+# bays, broad estuaries, inlets and passages between islands.
+bridge_mask <- ifel(
+  water_fraction >= min_bridge_water_fraction,
+  1,
+  NA
+)
+
+bridge_mask <- mask(
+  bridge_mask,
+  aoi_mask
+)
+
+names(bridge_mask) <- "marine_bridge_cells"
+
+# ------------------------------------------------------------
+# Raw boundary cells
+# ------------------------------------------------------------
+#
+# We retain the RAW Borneo boundary here. It is NOT used as a connected
+# propagation network; it only identifies terminal shoreline cells that may
+# receive a value. Therefore riverbanks cannot create an upstream chain.
+
+raw_land_union <- st_union(borneo_local_sf)
+raw_boundary_sf <- st_as_sf(
+  st_boundary(raw_land_union)
+)
+raw_boundary_v <- vect(raw_boundary_sf)
+
+raw_boundary_mask <- rasterize(
+  raw_boundary_v,
+  template,
+  field = 1,
+  touches = TRUE
+)
+
+raw_boundary_mask <- mask(
+  raw_boundary_mask,
+  aoi_mask
+)
+
+names(raw_boundary_mask) <- "raw_boundary_cells"
+
+# ------------------------------------------------------------
+# Terminal coastal cells
+# ------------------------------------------------------------
+#
+# Include:
+#   1. every coarse cell touched by the mapped land boundary; and
+#   2. every cell containing some mapped water but less than the bridge
+#      threshold.
+#
+# A terminal cell may be filled from an adjacent original/bridge cell, but
+# it is NEVER used as a seed for the next fill step. This is the river stop.
+
+wf_v <- values(water_fraction, mat = FALSE)
+rb_v <- values(raw_boundary_mask, mat = FALSE)
+br_v <- values(bridge_mask, mat = FALSE)
+aoi_v <- values(aoi_mask, mat = FALSE)
+
+terminal_v <- rep(
+  NA_real_,
+  ncell(template)
+)
+
+terminal_condition <- (
+  !is.na(aoi_v) &
+    is.na(br_v) &
+    (
+      !is.na(rb_v) |
+        (!is.na(wf_v) & wf_v > 0)
+    )
+)
+
+terminal_v[terminal_condition] <- 1
+
+coastal_target_mask <- rast(template)
+values(coastal_target_mask) <- terminal_v
+names(coastal_target_mask) <- "terminal_coastal_cells"
+
+# ------------------------------------------------------------
+# QA outputs
+# ------------------------------------------------------------
+
+write_raster(
+  aoi_mask,
+  file.path(output_root, "qa", "analysis_AOI_raster_mask.tif")
+)
+
+write_raster(
+  water_fraction,
+  file.path(output_root, "qa", "MODEL_CELL_MAPPED_WATER_FRACTION.tif")
+)
+
+write_raster(
+  bridge_mask,
+  file.path(
+    output_root,
+    "qa",
+    paste0(
+      "MARINE_BRIDGE_CELLS_water_fraction_ge_",
+      gsub("\\.", "_", as.character(min_bridge_water_fraction)),
+      ".tif"
+    )
+  )
+)
+
+write_raster(
+  raw_boundary_mask,
+  file.path(output_root, "qa", "RAW_BORNEO_BOUNDARY_CELLS.tif")
+)
+
+write_raster(
+  coastal_target_mask,
+  file.path(output_root, "qa", "TERMINAL_COASTAL_TARGET_CELLS.tif")
+)
+
+st_write(
+  raw_boundary_sf,
+  file.path(output_root, "qa", "RAW_BORNEO_BOUNDARY.gpkg"),
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+
+# Save AOI and land for visual QA.
+st_write(
+  st_as_sf(marine_sf),
+  file.path(output_root, "qa", "analysis_AOI.gpkg"),
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+
+st_write(
+  borneo_sf,
+  file.path(output_root, "qa", "borneo_land_used_for_masking.gpkg"),
+  delete_dsn = TRUE,
+  quiet = TRUE
+)
+
+
+# -----------------------------
+# 6. NetCDF reader
+# -----------------------------
+
+read_variable_year <- function(ncfile, varname) {
+  
+  r <- rast(
+    ncfile,
+    subds = varname,
+    drivers = "NETCDF"
+  )
+  
+  if (nlyr(r) != 12) {
+    stop(
+      "Expected 12 monthly layers for ", varname,
+      " in ", basename(ncfile),
+      " but found ", nlyr(r)
+    )
+  }
+  
+  if (is.na(crs(r)) || crs(r) == "") {
+    crs(r) <- "EPSG:4326"
+  }
+  
+  # All annual files in this dataset should share the same grid.
+  r <- crop(r, ext(template), snap = "out")
+  
+  if (!compareGeom(
+    r,
+    template,
+    stopOnError = FALSE,
+    crs = TRUE,
+    ext = TRUE,
+    rowcol = TRUE,
+    res = TRUE
+  )) {
+    stop(
+      "Raster geometry differs from the template for ",
+      varname, " in ", basename(ncfile),
+      ". Investigate before resampling."
+    )
+  }
+  
+  # Restrict only to the analysis AOI.
+  #
+  # Do NOT mask the source model with the coastline/land mask here.
+  # The NetCDF wet/dry mask is authoritative for where original model
+  # values exist. Coastal filling is applied later ONLY to missing cells.
+  r <- mask(r, aoi_mask)
+  
+  names(r) <- month.abb
+  
+  r
+}
+
+
+# -----------------------------
+# 7. Coastal fill function
+# -----------------------------
+
+fill_coastal_nearest <- function(
+    x,
+    bridge_mask,
+    coastal_target_mask,
+    max_fill_km = 50
+) {
+  
+  # PURPOSE
+  # -------
+  # Extend model values into coastal no-data cells WITHOUT:
+  #   1. deleting or changing any original valid model value;
+  #   2. closing genuine bays/inlets/island passages; or
+  #   3. allowing terminal riverbank/coastal cells to propagate upstream.
+  #
+  # The model grid is ~0.1 degree (~11 km), so a 50 km maximum propagation
+  # distance is roughly 4-5 native grid cells. This is deliberately an
+  # extension of the coarse model field, not creation of a new fine-scale
+  # nearshore model.
+  
+  stopifnot(nlyr(x) == 1)
+  
+  original <- x
+  
+  orig_v <- values(original, mat = FALSE)
+  bridge_v <- values(bridge_mask, mat = FALSE)
+  coastal_v <- values(coastal_target_mask, mat = FALSE)
+  
+  is_bridge_cell <- !is.na(bridge_v)
+  is_terminal_coast <- !is.na(coastal_v)
+  original_valid <- !is.na(orig_v)
+  
+  # Original valid model cells are never candidates and are never changed.
+  #
+  # Bridge targets can propagate after being filled.
+  # Terminal coastal targets can receive a value but cannot propagate it.
+  bridge_targets <- (
+    is.na(orig_v) &
+      is_bridge_cell
+  )
+  
+  coastal_targets <- (
+    is.na(orig_v) &
+      is_terminal_coast
+  )
+  
+  candidate <- bridge_targets | coastal_targets
+  
+  fill_mask <- rast(original)
+  fill_mask[] <- NA
+  
+  if (!any(candidate) || !any(original_valid)) {
+    names(fill_mask) <- "coastal_fill"
+    return(list(
+      raster = original,
+      fill_mask = fill_mask
+    ))
+  }
+  
+  nr <- nrow(original)
+  nc <- ncol(original)
+  
+  original_matrix <- matrix(
+    orig_v,
+    nrow = nr,
+    ncol = nc,
+    byrow = TRUE
+  )
+  
+  candidate_matrix <- matrix(
+    candidate,
+    nrow = nr,
+    ncol = nc,
+    byrow = TRUE
+  )
+  
+  bridge_target_matrix <- matrix(
+    bridge_targets,
+    nrow = nr,
+    ncol = nc,
+    byrow = TRUE
+  )
+  
+  coastal_target_matrix <- matrix(
+    coastal_targets,
+    nrow = nr,
+    ncol = nc,
+    byrow = TRUE
+  )
+  
+  # seed_matrix contains cells that are allowed to propagate values farther.
+  #
+  # Original model cells can seed filling.
+  # Newly filled MARINE BRIDGE cells can also seed filling.
+  # Newly filled TERMINAL COASTAL cells cannot seed another cell.
+  #
+  # This retains connected bays, estuaries and island passages while
+  # preventing a chain of riverbank cells from walking progressively inland.
+  seed_matrix <- original_matrix
+  
+  final_fill_matrix <- original_matrix
+  
+  filled_matrix <- matrix(
+    FALSE,
+    nrow = nr,
+    ncol = nc
+  )
+  
+  # Convert the user-defined maximum distance to an approximate number of
+  # native grid-cell propagation steps.
+  mid_lat <- (ymin(original) + ymax(original)) / 2
+  
+  dx_km <- abs(res(original)[1]) * 111.32 * cos(mid_lat * pi / 180)
+  dy_km <- abs(res(original)[2]) * 111.32
+  
+  native_step_km <- min(dx_km, dy_km)
+  
+  max_iterations <- max(
+    1L,
+    as.integer(ceiling(max_fill_km / native_step_km))
+  )
+  
+  # Helper to shift a matrix by one cell.
+  shift_matrix <- function(m, dr, dc) {
+    
+    out <- matrix(
+      NA_real_,
+      nrow = nrow(m),
+      ncol = ncol(m)
+    )
+    
+    r_to <- seq_len(nrow(m))
+    c_to <- seq_len(ncol(m))
+    
+    r_from <- r_to - dr
+    c_from <- c_to - dc
+    
+    good_r <- r_from >= 1 & r_from <= nrow(m)
+    good_c <- c_from >= 1 & c_from <= ncol(m)
+    
+    if (any(good_r) && any(good_c)) {
+      out[good_r, good_c] <- m[
+        r_from[good_r],
+        c_from[good_c],
+        drop = FALSE
+      ]
+    }
+    
+    out
+  }
+  
+  # Use 8-neighbour connectivity. On an ~11 km coastal grid this avoids
+  # artificial blocking where the only connection through a bay, inlet or
+  # island passage is diagonal. River control comes from the water-fraction
+  # bridge threshold plus the non-propagating terminal coastal cells.
+  neighbour_offsets <- rbind(
+    c(-1, -1), c(-1,  0), c(-1,  1),
+    c( 0, -1),             c( 0,  1),
+    c( 1, -1), c( 1,  0), c( 1,  1)
+  )
+  
+  for (iter in seq_len(max_iterations)) {
+    
+    neighbour_stack <- lapply(
+      seq_len(nrow(neighbour_offsets)),
+      function(k) {
+        shift_matrix(
+          seed_matrix,
+          neighbour_offsets[k, 1],
+          neighbour_offsets[k, 2]
+        )
+      }
+    )
+    
+    neighbour_count <- matrix(
+      0L,
+      nrow = nr,
+      ncol = nc
+    )
+    
+    neighbour_sum <- matrix(
+      0,
+      nrow = nr,
+      ncol = nc
+    )
+    
+    for (nm in neighbour_stack) {
+      ok <- !is.na(nm)
+      neighbour_count[ok] <- neighbour_count[ok] + 1L
+      neighbour_sum[ok] <- neighbour_sum[ok] + nm[ok]
+    }
+    
+    neighbour_mean <- matrix(
+      NA_real_,
+      nrow = nr,
+      ncol = nc
+    )
+    
+    has_neighbour <- neighbour_count > 0L
+    
+    neighbour_mean[has_neighbour] <-
+      neighbour_sum[has_neighbour] /
+      neighbour_count[has_neighbour]
+    
+    # ----------------------------------------------------------
+    # Step A: fill marine bridge cells.
+    # ----------------------------------------------------------
+    #
+    # These cells may propagate onward in the next iteration, allowing the
+    # model field to cross genuine marine water in bays, inlets and passages
+    # between islands and reach the shoreline.
+    fill_bridge <- (
+      bridge_target_matrix &
+        is.na(final_fill_matrix) &
+        !is.na(neighbour_mean)
+    )
+    
+    if (any(fill_bridge)) {
+      final_fill_matrix[fill_bridge] <- neighbour_mean[fill_bridge]
+      seed_matrix[fill_bridge] <- neighbour_mean[fill_bridge]
+      filled_matrix[fill_bridge] <- TRUE
+    }
+    
+    # Recalculate neighbours after bridge cells have been added as seeds.
+    neighbour_stack2 <- lapply(
+      seq_len(nrow(neighbour_offsets)),
+      function(k) {
+        shift_matrix(
+          seed_matrix,
+          neighbour_offsets[k, 1],
+          neighbour_offsets[k, 2]
+        )
+      }
+    )
+    
+    neighbour_count2 <- matrix(
+      0L,
+      nrow = nr,
+      ncol = nc
+    )
+    
+    neighbour_sum2 <- matrix(
+      0,
+      nrow = nr,
+      ncol = nc
+    )
+    
+    for (nm in neighbour_stack2) {
+      ok <- !is.na(nm)
+      neighbour_count2[ok] <- neighbour_count2[ok] + 1L
+      neighbour_sum2[ok] <- neighbour_sum2[ok] + nm[ok]
+    }
+    
+    neighbour_mean2 <- matrix(
+      NA_real_,
+      nrow = nr,
+      ncol = nc
+    )
+    
+    has_neighbour2 <- neighbour_count2 > 0L
+    
+    neighbour_mean2[has_neighbour2] <-
+      neighbour_sum2[has_neighbour2] /
+      neighbour_count2[has_neighbour2]
+    
+    # ----------------------------------------------------------
+    # Step B: fill terminal coastal cells.
+    # ----------------------------------------------------------
+    #
+    # These receive a value but are NOT copied into seed_matrix. Therefore
+    # a filled shoreline/riverbank cell cannot seed another cell farther inland.
+    fill_coast <- (
+      coastal_target_matrix &
+        is.na(final_fill_matrix) &
+        !is.na(neighbour_mean2)
+    )
+    
+    if (any(fill_coast)) {
+      final_fill_matrix[fill_coast] <- neighbour_mean2[fill_coast]
+      filled_matrix[fill_coast] <- TRUE
+    }
+    
+    if (!any(fill_bridge) && !any(fill_coast)) {
+      break
+    }
+  }
+  
+  # Start final output from the untouched original raster and add only
+  # explicitly filled cells.
+  final_matrix <- final_fill_matrix
+  
+  final <- rast(original)
+  values(final) <- as.vector(t(final_matrix))
+  
+  fmv <- rep(
+    NA_real_,
+    ncell(fill_mask)
+  )
+  
+  fmv[as.vector(t(filled_matrix))] <- 1
+  values(fill_mask) <- fmv
+  
+  names(fill_mask) <- "coastal_fill"
+  
+  # ----------------------------------------------------------
+  # Safety checks: original data must never be lost or changed
+  # ----------------------------------------------------------
+  
+  final_v <- values(final, mat = FALSE)
+  
+  lost_original <- (
+    !is.na(orig_v) &
+      is.na(final_v)
+  )
+  
+  if (any(lost_original)) {
+    stop(
+      "Coastal-fill safety check failed: ",
+      sum(lost_original),
+      " original valid cells were lost."
+    )
+  }
+  
+  changed_original <- (
+    !is.na(orig_v) &
+      !is.na(final_v) &
+      abs(final_v - orig_v) > 1e-12
+  )
+  
+  if (any(changed_original)) {
+    stop(
+      "Coastal-fill safety check failed: ",
+      sum(changed_original),
+      " original model values were modified."
+    )
+  }
+  
+  list(
+    raster = final,
+    fill_mask = fill_mask
+  )
+}
+
+
+# -----------------------------
+# 8. Build one period climatology
+# -----------------------------
+
+qa_log <- data.frame(
+  scenario = character(),
+  period = character(),
+  variable = character(),
+  year = integer(),
+  month = integer(),
+  issue = character(),
+  stringsAsFactors = FALSE
+)
+
+append_qa <- function(row) {
+  qa_log <<- rbind(qa_log, row)
+}
+
+make_period_climatology <- function(
+    inventory,
+    period_name,
+    start_year,
+    end_year,
+    varname,
+    varlabel
+) {
+  
+  selected <- select_period(
+    inventory,
+    start_year,
+    end_year
+  )
+  
+  years <- selected$year
+  scenario <- selected$scenario[1]
+  
+  message(
+    "\nProcessing ",
+    scenario, " | ", period_name, " | ",
+    varname, " | ",
+    min(years), "-", max(years)
+  )
+  
+  # Read each annual NetCDF only once for this variable.
+  annual_rasters <- vector("list", nrow(selected))
+  
+  for (i in seq_len(nrow(selected))) {
+    annual_rasters[[i]] <- read_variable_year(
+      selected$file[i],
+      varname
+    )
+  }
+  
+  raw_monthly <- vector("list", 12)
+  filled_monthly <- vector("list", 12)
+  valid_counts <- vector("list", 12)
+  fill_masks <- vector("list", 12)
+  
+  for (m in 1:12) {
+    
+    month_layers <- rast(
+      lapply(
+        annual_rasters,
+        function(r) r[[m]]
+      )
+    )
+    
+    names(month_layers) <- as.character(years)
+    
+    # Identify all-masked / all-NA year-month layers.
+    non_na_by_layer <- global(
+      !is.na(month_layers),
+      "sum",
+      na.rm = TRUE
+    )
+    
+    zero_layers <- which(
+      is.na(non_na_by_layer[, 1]) |
+        non_na_by_layer[, 1] == 0
+    )
+    
+    if (length(zero_layers) > 0) {
+      for (z in zero_layers) {
+        append_qa(
+          data.frame(
+            scenario = scenario,
+            period = period_name,
+            variable = varname,
+            year = years[z],
+            month = m,
+            issue = "all values masked / no valid cells in Sabah analysis area",
+            stringsAsFactors = FALSE
+          )
+        )
+      }
+    }
+    
+    # Number of valid contributing years at each grid cell.
+    n_valid <- sum(
+      !is.na(month_layers),
+      na.rm = TRUE
+    )
+    
+    # Multi-year mean for this calendar month.
+    # This RAW climatology preserves the NetCDF model mask; no coastline
+    # mask or coastal extrapolation has been applied.
+    clim_raw <- mean(
+      month_layers,
+      na.rm = TRUE
+    )
+    
+    clim_raw[n_valid == 0] <- NA
+    
+    names(clim_raw) <- month.abb[m]
+    names(n_valid) <- month.abb[m]
+    
+    # Fill only the small coastal slivers in the FINAL climatology,
+    # not in the individual years. This avoids inventing data for a
+    # genuinely missing/corrupt year-month.
+    ff <- fill_coastal_nearest(
+      clim_raw,
+      bridge_mask = bridge_mask,
+      coastal_target_mask = coastal_target_mask,
+      max_fill_km = max_fill_km
+    )
+    
+    raw_monthly[[m]] <- clim_raw
+    filled_monthly[[m]] <- ff$raster
+    valid_counts[[m]] <- n_valid
+    fill_masks[[m]] <- ff$fill_mask
+  }
+  
+  raw_stack <- rast(raw_monthly)
+  filled_stack <- rast(filled_monthly)
+  count_stack <- rast(valid_counts)
+  fill_stack <- rast(fill_masks)
+  
+  names(raw_stack) <- month.abb
+  names(filled_stack) <- month.abb
+  names(count_stack) <- month.abb
+  names(fill_stack) <- month.abb
+  
+  period_id <- paste0(
+    scenario, "_",
+    start_year, "_", end_year
+  )
+  
+  var_dir <- file.path(
+    output_root,
+    "climatologies",
+    period_id,
+    safe_name(varname)
+  )
+  
+  dir.create(var_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  raw_path <- file.path(
+    var_dir,
+    paste0(varname, "_monthly_climatology_RAW.tif")
+  )
+  
+  filled_path <- file.path(
+    var_dir,
+    paste0(varname, "_monthly_climatology_coastfilled.tif")
+  )
+  
+  count_path <- file.path(
+    var_dir,
+    paste0(varname, "_valid_year_count_by_month.tif")
+  )
+  
+  fill_mask_path <- file.path(
+    var_dir,
+    paste0(varname, "_coastal_fill_mask_by_month.tif")
+  )
+  
+  write_raster(raw_stack, raw_path)
+  write_raster(filled_stack, filled_path)
+  write_raster(count_stack, count_path)
+  write_raster(fill_stack, fill_mask_path)
+  
+  # Day-weighted annual climatological mean.
+  month_weights <- period_month_weights(years)
+  
+  annual_mean <- app(
+    filled_stack,
+    fun = function(z) {
+      if (all(is.na(z))) return(NA_real_)
+      weighted.mean(
+        z,
+        w = month_weights,
+        na.rm = TRUE
+      )
+    }
+  )
+  
+  names(annual_mean) <- "annual_climatological_mean"
+  
+  annual_path <- file.path(
+    var_dir,
+    paste0(varname, "_annual_climatological_mean.tif")
+  )
+  
+  write_raster(annual_mean, annual_path)
+  
+  # Seasonal stress-oriented summary.
+  seasonal_rule <- variables$seasonal_summary[
+    match(varname, variables$var)
+  ]
+  
+  seasonal_path <- NA_character_
+  
+  if (!is.na(seasonal_rule) && seasonal_rule == "max") {
+    
+    seasonal <- max(
+      filled_stack,
+      na.rm = TRUE
+    )
+    
+    names(seasonal) <- "warmest_climatological_month"
+    
+    seasonal_path <- file.path(
+      var_dir,
+      paste0(varname, "_warmest_climatological_month.tif")
+    )
+    
+    write_raster(seasonal, seasonal_path)
+    
+  } else if (!is.na(seasonal_rule) && seasonal_rule == "min") {
+    
+    seasonal <- min(
+      filled_stack,
+      na.rm = TRUE
+    )
+    
+    names(seasonal) <- "lowest_climatological_month"
+    
+    seasonal_path <- file.path(
+      var_dir,
+      paste0(varname, "_lowest_climatological_month.tif")
+    )
+    
+    write_raster(seasonal, seasonal_path)
+  }
+  
+  data.frame(
+    scenario = scenario,
+    period_name = period_name,
+    start_year = start_year,
+    end_year = end_year,
+    variable = varname,
+    label = varlabel,
+    monthly_raw = raw_path,
+    monthly_filled = filled_path,
+    valid_count = count_path,
+    fill_mask = fill_mask_path,
+    annual_mean = annual_path,
+    seasonal_summary = seasonal_path,
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# -----------------------------
+# 9. Process historical baseline
+# -----------------------------
+
+manifest <- data.frame()
+
+for (i in seq_len(nrow(variables))) {
+  
+  result <- make_period_climatology(
+    inventory = historic_inventory,
+    period_name = paste0(
+      "historical_",
+      baseline_period[1], "_", baseline_period[2]
+    ),
+    start_year = baseline_period[1],
+    end_year = baseline_period[2],
+    varname = variables$var[i],
+    varlabel = variables$label[i]
+  )
+  
+  manifest <- rbind(manifest, result)
+}
+
+
+# -----------------------------
+# 10. Process future periods
+# -----------------------------
+
+future_inventories <- list(
+  rcp45 = rcp45_inventory,
+  rcp85 = rcp85_inventory
+)
+
+for (scenario_name in names(future_inventories)) {
+  
+  inv <- future_inventories[[scenario_name]]
+  
+  for (period_name in names(future_periods)) {
+    
+    yrs <- future_periods[[period_name]]
+    
+    for (i in seq_len(nrow(variables))) {
+      
+      result <- make_period_climatology(
+        inventory = inv,
+        period_name = period_name,
+        start_year = yrs[1],
+        end_year = yrs[2],
+        varname = variables$var[i],
+        varlabel = variables$label[i]
+      )
+      
+      manifest <- rbind(manifest, result)
+    }
+  }
+}
+
+write.csv(
+  manifest,
+  file.path(output_root, "metadata", "output_manifest.csv"),
+  row.names = FALSE
+)
+
+
+# -----------------------------
+# 11. Change from historical baseline
+# -----------------------------
+
+baseline_rows <- manifest[
+  manifest$scenario == "historical",
+]
+
+future_rows <- manifest[
+  manifest$scenario %in% c("rcp45", "rcp85"),
+]
+
+change_manifest <- data.frame()
+
+for (i in seq_len(nrow(future_rows))) {
+  
+  fr <- future_rows[i, ]
+  
+  br <- baseline_rows[
+    baseline_rows$variable == fr$variable,
+  ]
+  
+  if (nrow(br) != 1) {
+    warning("Could not identify one historical baseline for ", fr$variable)
+    next
+  }
+  
+  future_annual <- rast(fr$annual_mean)
+  baseline_annual <- rast(br$annual_mean)
+  
+  delta_annual <- future_annual - baseline_annual
+  
+  out_dir <- file.path(
+    output_root,
+    "change_from_baseline",
+    paste0(fr$scenario, "_", fr$start_year, "_", fr$end_year),
+    safe_name(fr$variable)
+  )
+  
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  delta_path <- file.path(
+    out_dir,
+    paste0(fr$variable, "_annual_change_from_",
+           baseline_period[1], "_", baseline_period[2], ".tif")
+  )
+  
+  write_raster(delta_annual, delta_path)
+  
+  # Month-by-month climatological change.
+  future_monthly <- rast(fr$monthly_filled)
+  baseline_monthly <- rast(br$monthly_filled)
+  
+  delta_monthly <- future_monthly - baseline_monthly
+  names(delta_monthly) <- month.abb
+  
+  delta_monthly_path <- file.path(
+    out_dir,
+    paste0(fr$variable, "_monthly_change_from_",
+           baseline_period[1], "_", baseline_period[2], ".tif")
+  )
+  
+  write_raster(delta_monthly, delta_monthly_path)
+  
+  pct_path <- NA_character_
+  
+  if (fr$variable %in% percent_change_variables) {
+    
+    pct <- 100 * (future_annual - baseline_annual) / baseline_annual
+    
+    # Avoid nonsensical percentage change where the baseline is extremely
+    # close to zero.
+    pct[abs(baseline_annual) < 1e-12] <- NA
+    
+    names(pct) <- "percent_change"
+    
+    pct_path <- file.path(
+      out_dir,
+      paste0(fr$variable, "_annual_percent_change_from_",
+             baseline_period[1], "_", baseline_period[2], ".tif")
+    )
+    
+    write_raster(pct, pct_path)
+  }
+  
+  seasonal_delta_path <- NA_character_
+  
+  if (
+    !is.na(fr$seasonal_summary) &&
+    nzchar(fr$seasonal_summary) &&
+    !is.na(br$seasonal_summary) &&
+    nzchar(br$seasonal_summary) &&
+    file.exists(fr$seasonal_summary) &&
+    file.exists(br$seasonal_summary)
+  ) {
+    
+    future_seasonal <- rast(fr$seasonal_summary)
+    baseline_seasonal <- rast(br$seasonal_summary)
+    
+    seasonal_delta <- future_seasonal - baseline_seasonal
+    
+    seasonal_delta_path <- file.path(
+      out_dir,
+      paste0(fr$variable, "_seasonal_stress_change_from_",
+             baseline_period[1], "_", baseline_period[2], ".tif")
+    )
+    
+    write_raster(
+      seasonal_delta,
+      seasonal_delta_path
+    )
+  }
+  
+  change_manifest <- rbind(
+    change_manifest,
+    data.frame(
+      scenario = fr$scenario,
+      start_year = fr$start_year,
+      end_year = fr$end_year,
+      variable = fr$variable,
+      annual_absolute_change = delta_path,
+      monthly_absolute_change = delta_monthly_path,
+      annual_percent_change = pct_path,
+      seasonal_stress_change = seasonal_delta_path,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+write.csv(
+  change_manifest,
+  file.path(output_root, "metadata", "change_manifest.csv"),
+  row.names = FALSE
+)
+
+
+# -----------------------------
+# 12. QA log
+# -----------------------------
+
+# The dataset description specifically notes that RCP4.5 September 2051
+# is corrupted / fully masked. The script also detects any other all-masked
+# year-month-variable layers automatically.
+write.csv(
+  qa_log,
+  file.path(output_root, "qa", "masked_or_missing_year_months.csv"),
+  row.names = FALSE
+)
+
+message("\n============================================================")
+message("Processing finished.")
+message("Output folder:")
+message(output_root)
+message("============================================================")
+message(
+  "Before using outputs as final SMV layers, confirm that ",
+  "marine_aoi_path points to the agreed Sabah marine planning boundary."
+)
